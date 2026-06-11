@@ -57,6 +57,60 @@ void EnergyMonitor::currentTX(unsigned int _channel, double _ICAL)
   offsetI = ADC_COUNTS>>1;
 }
 
+// bootstrap low-pass filters
+void EnergyMonitor::bootstrap()
+{
+  const unsigned int crossings = 100;
+  const unsigned int timeout = 5000;
+
+  unsigned long start = millis();
+
+  unsigned int crossCount = 0;
+  unsigned int numberOfSamples = 0;
+
+  // wait for a mid-point (zero) crossing to start:
+  while(1)
+  {
+    startV = analogRead(inPinV);
+    if ((startV < (ADC_COUNTS*0.55)) && (startV > (ADC_COUNTS*0.45))) break;
+    if ((millis()-start)>timeout) break;
+  }
+
+  start = millis();
+  double sumV = 0.0d;
+  double sumI = 0.0d;
+  while ((crossCount < crossings) && ((millis()-start)<timeout))
+  {
+    numberOfSamples++;
+    sampleV = analogRead(inPinV);
+    sampleI = analogRead(inPinI);
+    sumV += sampleV;
+    sumI += sampleI;
+
+    lastVCross = checkVCross;
+    if (sampleV > startV) checkVCross = true;
+                     else checkVCross = false;
+    if (numberOfSamples==1) lastVCross = checkVCross;
+
+    if (lastVCross != checkVCross) crossCount++;
+  }
+
+  offsetV = sumV / numberOfSamples;
+  offsetI = sumI / numberOfSamples;
+
+  Serial.print(offsetV);
+  Serial.print(' ');
+  Serial.print(offsetI);
+  Serial.print(' ');
+  Serial.print(numberOfSamples);
+  Serial.print(' ');
+  Serial.print(sumV);
+  Serial.print(' ');
+  Serial.print(sumI);
+  Serial.print(' ');
+  Serial.println(" (offsetV, offsetI, n, sumV, sumI)");
+}
+
 //--------------------------------------------------------------------------------------
 // emon_calc procedure
 // Calculates realPower,apparentPower,powerFactor,Vrms,Irms,kWh increment
@@ -67,6 +121,8 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
 {
   #if defined emonTxV3
   int SupplyVoltage=3300;
+  #elif defined(ARDUINO_UNOR4_WIFI) || defined(ARDUINO_UNOR4_MINIMA)
+  int SupplyVoltage=5000;
   #else
   int SupplyVoltage = readVcc();
   #endif
@@ -106,9 +162,9 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     // B) Apply digital low pass filters to extract the 2.5 V or 1.65 V dc offset,
     //     then subtract this - signal is now centred on 0 counts.
     //-----------------------------------------------------------------------------
-    offsetV = offsetV + ((sampleV-offsetV)/1024);
+    offsetV = offsetV + ((sampleV-offsetV)/16384);
     filteredV = sampleV - offsetV;
-    offsetI = offsetI + ((sampleI-offsetI)/1024);
+    offsetI = offsetI + ((sampleI-offsetI)/16384);
     filteredI = sampleI - offsetI;
 
     //-----------------------------------------------------------------------------
@@ -133,6 +189,10 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     //-----------------------------------------------------------------------------
     instP = phaseShiftedV * filteredI;          //Instantaneous Power
     sumP +=instP;                               //Sum
+
+    // sum +ve and -ve flows separately, so we can get more accurate bidirectional flows:
+    if (instP > 0) sumPp += instP;
+    if (instP < 0) sumPn += instP;
 
     //-----------------------------------------------------------------------------
     // G) Find the number of times the voltage has crossed the initial voltage
@@ -161,6 +221,8 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
 
   //Calculation power values
   realPower = V_RATIO * I_RATIO * sumP / numberOfSamples;
+  positiveRealPower = V_RATIO * I_RATIO * sumPp / numberOfSamples;
+  negativeRealPower = V_RATIO * I_RATIO * sumPn / numberOfSamples;
   apparentPower = Vrms * Irms;
   powerFactor=realPower / apparentPower;
 
@@ -168,6 +230,8 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
   sumV = 0;
   sumI = 0;
   sumP = 0;
+  sumPp = 0;
+  sumPn = 0;
 //--------------------------------------------------------------------------------------
 }
 
@@ -188,7 +252,7 @@ double EnergyMonitor::calcIrms(unsigned int Number_of_Samples)
 
     // Digital low pass filter extracts the 2.5 V or 1.65 V dc offset,
     //  then subtract this - signal is now centered on 0 counts.
-    offsetI = (offsetI + (sampleI-offsetI)/1024);
+    offsetI = (offsetI + (sampleI-offsetI)/16384);
     filteredI = sampleI - offsetI;
 
     // Root-mean-square method current
@@ -210,17 +274,28 @@ double EnergyMonitor::calcIrms(unsigned int Number_of_Samples)
 
 void EnergyMonitor::serialprint()
 {
+  Serial.print("P=");
   Serial.print(realPower);
   Serial.print(' ');
+  Serial.print("P+=");
+  Serial.print(positiveRealPower);
+  Serial.print(' ');
+  Serial.print("P-=");
+  Serial.print(negativeRealPower);
+  Serial.print(' ');
+  Serial.print("VA=");
   Serial.print(apparentPower);
   Serial.print(' ');
+  Serial.print("V=");
   Serial.print(Vrms);
   Serial.print(' ');
+  Serial.print("I=");
   Serial.print(Irms);
   Serial.print(' ');
+  Serial.print("phi=");
   Serial.print(powerFactor);
   Serial.println(' ');
-  delay(100);
+  // delay(100);
 }
 
 //thanks to http://hacking.majenko.co.uk/making-accurate-adc-readings-on-arduino

@@ -33,7 +33,9 @@
 // include the following line in main sketch inside setup() function:
 //  analogReadResolution(ADC_BITS);
 // otherwise will default to 10 bits, as in regular Arduino-based boards.
-#if defined(__arm__)
+#if defined(ARDUINO_UNOR4_WIFI)
+#define ADC_BITS    14
+#elif defined(__arm__)
 #define ADC_BITS    12
 #else
 #define ADC_BITS    10
@@ -56,9 +58,13 @@ class EnergyMonitor
     double calcIrms(unsigned int NUMBER_OF_SAMPLES);
     void serialprint();
 
+    void bootstrap();
+
     long readVcc();
     //Useful value variables
     double realPower,
+      positiveRealPower,
+      negativeRealPower,
       apparentPower,
       powerFactor,
       Vrms,
@@ -88,7 +94,7 @@ class EnergyMonitor
 
     double phaseShiftedV;                             //Holds the calibrated phase shifted voltage.
 
-    double sqV,sumV,sqI,sumI,instP,sumP;              //sq = squared, sum = Sum, inst = instantaneous
+    double sqV,sumV,sqI,sumI,instP,sumP,sumPp, sumPn; //sq = squared, sum = Sum, inst = instantaneous
 
     int startV;                                       //Instantaneous voltage at start of sample window.
 
