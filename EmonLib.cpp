@@ -18,7 +18,6 @@
 #include "WProgram.h"
 #endif
 
-
 //--------------------------------------------------------------------------------------
 // Sets the pins to be used for voltage and current sensors
 //--------------------------------------------------------------------------------------
@@ -30,31 +29,12 @@ void EnergyMonitor::voltage(unsigned int _inPinV, double _VCAL, double _PHASECAL
   offsetV = ADC_COUNTS>>1;
 }
 
-void EnergyMonitor::current(unsigned int _inPinI, double _ICAL)
+void EnergyMonitor::current(size_t channel, unsigned int _inPinI, double _ICAL)
 {
-  inPinI = _inPinI;
-  ICAL = _ICAL;
-  offsetI = ADC_COUNTS>>1;
-}
-
-//--------------------------------------------------------------------------------------
-// Sets the pins to be used for voltage and current sensors based on emontx pin map
-//--------------------------------------------------------------------------------------
-void EnergyMonitor::voltageTX(double _VCAL, double _PHASECAL)
-{
-  inPinV = 2;
-  VCAL = _VCAL;
-  PHASECAL = _PHASECAL;
-  offsetV = ADC_COUNTS>>1;
-}
-
-void EnergyMonitor::currentTX(unsigned int _channel, double _ICAL)
-{
-  if (_channel == 1) inPinI = 3;
-  if (_channel == 2) inPinI = 0;
-  if (_channel == 3) inPinI = 1;
-  ICAL = _ICAL;
-  offsetI = ADC_COUNTS>>1;
+  if (channel >= EMON_I_CHANNELS) return;
+  inPinI[channel] = _inPinI;
+  ICAL[channel] = _ICAL;
+  offsetI[channel] = ADC_COUNTS>>1;
 }
 
 // bootstrap low-pass filters
@@ -67,6 +47,7 @@ void EnergyMonitor::bootstrap()
 
   unsigned int crossCount = 0;
   unsigned int numberOfSamples = 0;
+  int startV = 0;
 
   // wait for a mid-point (zero) crossing to start:
   while(1)
@@ -78,14 +59,21 @@ void EnergyMonitor::bootstrap()
 
   start = millis();
   double sumV = 0.0d;
-  double sumI = 0.0d;
+  double sumI[EMON_I_CHANNELS] = {0};
+  boolean lastVCross = false, checkVCross = false;
+
   while ((crossCount < crossings) && ((millis()-start)<timeout))
   {
     numberOfSamples++;
     sampleV = analogRead(inPinV);
-    sampleI = analogRead(inPinI);
+    for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+      sampleI[i] = analogRead(inPinI[i]);
+    }
+
     sumV += sampleV;
-    sumI += sampleI;
+    for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+      sumI[i] += sampleI[i];
+    }
 
     lastVCross = checkVCross;
     if (sampleV > startV) checkVCross = true;
@@ -96,19 +84,28 @@ void EnergyMonitor::bootstrap()
   }
 
   offsetV = sumV / numberOfSamples;
-  offsetI = sumI / numberOfSamples;
+
+  for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+    offsetI[i] = sumI[i] / numberOfSamples;
+  }
 
   Serial.print(offsetV);
   Serial.print(' ');
-  Serial.print(offsetI);
+  for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+    Serial.print(offsetI[i]);
+    Serial.print(',');
+  }
   Serial.print(' ');
   Serial.print(numberOfSamples);
   Serial.print(' ');
   Serial.print(sumV);
   Serial.print(' ');
-  Serial.print(sumI);
+  for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+    Serial.print(sumI[i]);
+    Serial.print(',');
+  }
   Serial.print(' ');
-  Serial.println(" (offsetV, offsetI, n, sumV, sumI)");
+  Serial.println(" (offsetV, offsetI[], n, sumV, sumI[])");
 }
 
 //--------------------------------------------------------------------------------------
@@ -126,6 +123,22 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
   #else
   int SupplyVoltage = readVcc();
   #endif
+  double sqV = 0.0d,
+         sumV = 0.0d,
+         phaseShiftedV = 0.0d,
+         sqI[EMON_I_CHANNELS] = {0},
+         sumI[EMON_I_CHANNELS] = {0},
+         instP[EMON_I_CHANNELS] = {0},
+         sumP[EMON_I_CHANNELS] = {0};
+         //sumPp[EMON_I_CHANNELS] = {0},
+         //sumPn[EMON_I_CHANNELS] = {0}
+   //sq = squared, sum = Sum, inst = instantaneous
+
+  double filteredV = 0.0d,
+         lastFilteredV = 0.0d;
+
+  boolean lastVCross = false, checkVCross = false;         //Used to measure number of times threshold is crossed.
+  int startV = 0;
 
   unsigned int crossCount = 0;                             //Used to measure number of times threshold is crossed.
   unsigned int numberOfSamples = 0;                        //This is now incremented
@@ -156,28 +169,32 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     // A) Read in raw voltage and current samples
     //-----------------------------------------------------------------------------
     sampleV = analogRead(inPinV);                 //Read in raw voltage signal
-    sampleI = analogRead(inPinI);                 //Read in raw current signal
+    for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+      sampleI[i] = analogRead(inPinI[i]);               //Read in raw current signal
+    }
 
     //-----------------------------------------------------------------------------
     // B) Apply digital low pass filters to extract the 2.5 V or 1.65 V dc offset,
     //     then subtract this - signal is now centred on 0 counts.
     //-----------------------------------------------------------------------------
-    offsetV = offsetV + ((sampleV-offsetV)/16384);
+    offsetV = offsetV + ((sampleV-offsetV)/8192);
     filteredV = sampleV - offsetV;
-    offsetI = offsetI + ((sampleI-offsetI)/16384);
-    filteredI = sampleI - offsetI;
+    for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+      offsetI[i] = offsetI[i] + ((sampleI[i]-offsetI[i])/8192);
+      filteredI[i] = sampleI[i] - offsetI[i];
+
+      //-----------------------------------------------------------------------------
+      // D) Root-mean-square method current
+      //-----------------------------------------------------------------------------
+      sqI[i] = filteredI[i] * filteredI[i];          //1) square current values
+      sumI[i] += sqI[i];                             //2) sum
+    }
 
     //-----------------------------------------------------------------------------
     // C) Root-mean-square method voltage
     //-----------------------------------------------------------------------------
     sqV= filteredV * filteredV;                 //1) square voltage values
     sumV += sqV;                                //2) sum
-
-    //-----------------------------------------------------------------------------
-    // D) Root-mean-square method current
-    //-----------------------------------------------------------------------------
-    sqI = filteredI * filteredI;                //1) square current values
-    sumI += sqI;                                //2) sum
 
     //-----------------------------------------------------------------------------
     // E) Phase calibration
@@ -187,12 +204,14 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     //-----------------------------------------------------------------------------
     // F) Instantaneous power calc
     //-----------------------------------------------------------------------------
-    instP = phaseShiftedV * filteredI;          //Instantaneous Power
-    sumP +=instP;                               //Sum
+    for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+      instP[i] = phaseShiftedV * filteredI[i];          //Instantaneous Power
+      sumP[i] += instP[i];                              //Sum
 
-    // sum +ve and -ve flows separately, so we can get more accurate bidirectional flows:
-    if (instP > 0) sumPp += instP;
-    if (instP < 0) sumPn += instP;
+      // sum +ve and -ve flows separately, so we can get more accurate bidirectional flows:
+      //if (instP[i] > 0) sumPp[i] += instP[i];
+      //if (instP[i] < 0) sumPn[i] += instP[i];
+    }
 
     //-----------------------------------------------------------------------------
     // G) Find the number of times the voltage has crossed the initial voltage
@@ -200,8 +219,8 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
     //    - so this method allows us to sample an integer number of half wavelengths which increases accuracy
     //-----------------------------------------------------------------------------
     lastVCross = checkVCross;
-    if (sampleV > startV) checkVCross = true;
-                     else checkVCross = false;
+    if (filteredV > 0) checkVCross = true;
+                  else checkVCross = false;
     if (numberOfSamples==1) lastVCross = checkVCross;
 
     if (lastVCross != checkVCross) crossCount++;
@@ -216,84 +235,77 @@ void EnergyMonitor::calcVI(unsigned int crossings, unsigned int timeout)
   double V_RATIO = VCAL *((SupplyVoltage/1000.0) / (ADC_COUNTS));
   Vrms = V_RATIO * sqrt(sumV / numberOfSamples);
 
-  double I_RATIO = ICAL *((SupplyVoltage/1000.0) / (ADC_COUNTS));
-  Irms = I_RATIO * sqrt(sumI / numberOfSamples);
+  for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+    double I_RATIO = ICAL[i] *((SupplyVoltage/1000.0) / (ADC_COUNTS));
+    Irms[i] = I_RATIO * sqrt(sumI[i] / numberOfSamples);
 
-  //Calculation power values
-  realPower = V_RATIO * I_RATIO * sumP / numberOfSamples;
-  positiveRealPower = V_RATIO * I_RATIO * sumPp / numberOfSamples;
-  negativeRealPower = V_RATIO * I_RATIO * sumPn / numberOfSamples;
-  apparentPower = Vrms * Irms;
-  powerFactor=realPower / apparentPower;
-
-  //Reset accumulators
-  sumV = 0;
-  sumI = 0;
-  sumP = 0;
-  sumPp = 0;
-  sumPn = 0;
-//--------------------------------------------------------------------------------------
-}
-
-//--------------------------------------------------------------------------------------
-double EnergyMonitor::calcIrms(unsigned int Number_of_Samples)
-{
-
-  #if defined emonTxV3
-    int SupplyVoltage=3300;
-  #else
-    int SupplyVoltage = readVcc();
-  #endif
-
-
-  for (unsigned int n = 0; n < Number_of_Samples; n++)
-  {
-    sampleI = analogRead(inPinI);
-
-    // Digital low pass filter extracts the 2.5 V or 1.65 V dc offset,
-    //  then subtract this - signal is now centered on 0 counts.
-    offsetI = (offsetI + (sampleI-offsetI)/16384);
-    filteredI = sampleI - offsetI;
-
-    // Root-mean-square method current
-    // 1) square current values
-    sqI = filteredI * filteredI;
-    // 2) sum
-    sumI += sqI;
+    //Calculation power values
+    realPower[i] = V_RATIO * I_RATIO * sumP[i] / numberOfSamples;
+    //positiveRealPower[i] = V_RATIO * I_RATIO * sumPp[i] / numberOfSamples;
+    //negativeRealPower[i] = V_RATIO * I_RATIO * sumPn[i] / numberOfSamples;
+    apparentPower[i] = Vrms * Irms[i];
+    powerFactor[i]=realPower[i] / apparentPower[i];
   }
-
-  double I_RATIO = ICAL *((SupplyVoltage/1000.0) / (ADC_COUNTS));
-  Irms = I_RATIO * sqrt(sumI / Number_of_Samples);
-
-  //Reset accumulators
-  sumI = 0;
-  //--------------------------------------------------------------------------------------
-
-  return Irms;
+//--------------------------------------------------------------------------------------
 }
+
+//--------------------------------------------------------------------------------------
+// double EnergyMonitor::calcIrms(unsigned int Number_of_Samples)
+// {
+//
+//   #if defined emonTxV3
+//     int SupplyVoltage=3300;
+//   #else
+//     int SupplyVoltage = readVcc();
+//   #endif
+//
+//
+//   for (unsigned int n = 0; n < Number_of_Samples; n++)
+//   {
+//     sampleI = analogRead(inPinI);
+//
+//     // Digital low pass filter extracts the 2.5 V or 1.65 V dc offset,
+//     //  then subtract this - signal is now centered on 0 counts.
+//     offsetI = (offsetI + (sampleI-offsetI)/16384);
+//     filteredI = sampleI - offsetI;
+//
+//     // Root-mean-square method current
+//     // 1) square current values
+//     sqI = filteredI * filteredI;
+//     // 2) sum
+//     sumI += sqI;
+//   }
+//
+//   double I_RATIO = ICAL *((SupplyVoltage/1000.0) / (ADC_COUNTS));
+//   Irms = I_RATIO * sqrt(sumI / Number_of_Samples);
+//
+//   //Reset accumulators
+//   sumI = 0;
+//   //--------------------------------------------------------------------------------------
+//
+//   return Irms;
+// }
 
 void EnergyMonitor::serialprint()
 {
-  Serial.print("P=");
-  Serial.print(realPower);
-  Serial.print(' ');
-  Serial.print("P+=");
-  Serial.print(positiveRealPower);
-  Serial.print(' ');
-  Serial.print("P-=");
-  Serial.print(negativeRealPower);
-  Serial.print(' ');
-  Serial.print("VA=");
-  Serial.print(apparentPower);
-  Serial.print(' ');
   Serial.print("V=");
   Serial.print(Vrms);
-  Serial.print(' ');
-  Serial.print("I=");
-  Serial.print(Irms);
-  Serial.print(' ');
-  Serial.print("phi=");
-  Serial.print(powerFactor);
+  for (size_t i = 0; i < EMON_I_CHANNELS; ++i) {
+    Serial.print("C:");
+    Serial.print(i);
+    Serial.print(" P=");
+    Serial.print(realPower[i]);
+    // Serial.print(" P+=");
+    // Serial.print(positiveRealPower[i]);
+    // Serial.print(" P-=");
+    // Serial.print(negativeRealPower[i]);
+    Serial.print(" VA=");
+    Serial.print(apparentPower[i]);
+    Serial.print(" I=");
+    Serial.print(Irms[i]);
+    Serial.print(" phi=");
+    Serial.print(powerFactor[i]);
+  }
   Serial.println(' ');
   // delay(100);
 }
